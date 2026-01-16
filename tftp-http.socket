@@ -1,0 +1,10 @@
+[Unit]
+Description=Tftp Custom Server Activation Socket
+
+[Socket]
+ListenDatagram=69
+ReusePort=true
+Accept=false
+
+[Install]
+WantedBy=sockets.target

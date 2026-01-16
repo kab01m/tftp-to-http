@@ -1,0 +1,16 @@
+[Unit]
+Description=Tftp Custom Server
+After=tftp-http.socket
+Documentation=https://github.com/kab01m/tftp-to-http
+
+[Service]
+ExecStart=python3 /export/SIS/in.tftp-http.py
+StandardOutput=journal
+StandardError=journal
+User=tftp
+Group=tftp
+PassEnvironment=LISTEN_FDS
+Type=oneshot
+
+[Install]
+Also=tftp-http.socket
