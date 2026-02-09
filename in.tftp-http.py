@@ -14,6 +14,7 @@ TFTP_ROOT_DIR = "/tftp"
 HTTP_ENDPOINT = "http://sas.labma.ru/cisco/"
 DEFAULT_BLOCKSIZE = 512
 ALLOWED_FILENAME_REGEX = re.compile(r'^cisco/[a-zA-Z0-9_\-\.]+-confg$')
+SOCKET_TIMEOUT = 10  # Таймаут для сокета в секундах
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,7 +35,7 @@ def send_file_to_http(filename, file_data):
             'Content-Type': 'application/octet-stream',
             'X-Filename': filename,
         }
-        response = requests.post(f"{HTTP_ENDPOINT}?{os.path.basename(filename)}", data=file_data, headers=headers)
+        response = requests.post(f"{HTTP_ENDPOINT}?{os.path.basename(filename)}", data=file_data, headers=headers, timeout=SOCKET_TIMEOUT)
         response.raise_for_status()
         logger.info(f"File {filename} sent to {HTTP_ENDPOINT} via POST. Response: {response.status_code}")
     except requests.exceptions.RequestException as e:
@@ -42,7 +43,17 @@ def send_file_to_http(filename, file_data):
 
 def handle_tftp(sock):
     """Handle TFTP requests on the given socket."""
-    data, addr = sock.recvfrom(1024)
+    sock.settimeout(SOCKET_TIMEOUT)  # Устанавливаем таймаут для сокета
+
+    try:
+        data, addr = sock.recvfrom(1024)
+    except socket.timeout:
+        logger.error("Socket timeout while waiting for request")
+        return
+    except socket.error as e:
+        logger.error(f"Socket error while waiting for request: {e}")
+        return
+
     opcode = data[:2]
 
     if opcode == struct.pack('!H', OP_RRQ):
@@ -118,6 +129,9 @@ def handle_tftp(sock):
         while True:
             try:
                 data, _ = sock.recvfrom(blksize + 4)  # +4 for opcode and block number
+            except socket.timeout:
+                logger.error("Socket timeout while waiting for data block")
+                break
             except socket.error as e:
                 logger.error(f"Socket error during upload: {e}")
                 break
@@ -128,13 +142,14 @@ def handle_tftp(sock):
                 if block_num == block + 1:
                     chunk = data[4:]
                     file_data.write(chunk)
-                    block += 1
-                    ack = struct.pack('!H', OP_ACK) + struct.pack('!H', block)
+                    ack = struct.pack('!H', OP_ACK) + struct.pack('!H', block_num)
                     sock.sendto(ack, addr)
+                    block = block_num
                     if len(chunk) < blksize:
                         break
                 else:
-                    break
+                    ack = struct.pack('!H', OP_ACK) + struct.pack('!H', block)
+                    sock.sendto(ack, addr)
             else:
                 break
 
