@@ -119,13 +119,18 @@ def handle_tftp(sock):
         if blksize > 65464:  # Maximum allowed block size per RFC 2348
             blksize = DEFAULT_BLOCKSIZE
 
-        # Send OACK if block size was negotiated
+        block = 0
+
+        # Send OACK if block size was negotiated or empty ACK if not
         if 'blksize' in options:
             oack = struct.pack('!H', OP_OACK) + b'blksize\x00' + str(blksize).encode() + b'\x00'
-            sock.sendto(oack, addr)
+        else:
+            oack = struct.pack('!H', OP_ACK) + struct.pack('!H', block)
+
+        sock.sendto(oack, addr)
 
         file_data = io.BytesIO()
-        block = 0
+
         while True:
             try:
                 data, _ = sock.recvfrom(blksize + 4)  # +4 for opcode and block number
