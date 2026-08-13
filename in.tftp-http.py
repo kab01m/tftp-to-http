@@ -8,6 +8,7 @@ import re
 import requests
 import sys
 import io
+import time
 
 # Configuration
 TFTP_ROOT_DIR = "/tftp"
@@ -41,6 +42,71 @@ def send_file_to_http(filename, file_data):
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to POST {filename}: {e}")
 
+def resolve_file_path(filename):
+    """Resolve a requested TFTP path safely inside TFTP_ROOT_DIR.
+
+    Handles absolute-looking requests (e.g. "/cisco/router-confg") and
+    prevents directory traversal ("../") outside the root directory.
+    Returns the absolute path or None if it escapes the root.
+    """
+    # Normalize separators and strip leading slashes so absolute requests
+    # are treated as relative to the TFTP root directory.
+    filename = filename.replace('\\', '/').lstrip('/')
+
+    root = os.path.realpath(TFTP_ROOT_DIR)
+    fullpath = os.path.realpath(os.path.join(root, filename))
+
+    try:
+        if os.path.commonpath([root, fullpath]) != root:
+            return None
+    except ValueError:
+        return None
+
+    return fullpath
+
+def _send_and_wait_ack(sock, addr, packet, expected_block, retries=5, timeout=3):
+    """Send a TFTP packet and wait for the matching ACK.
+
+    Retransmits the packet on timeout and ignores out-of-order ACKs.
+    Returns True when the expected ACK is received, False on error or
+    after exhausting retries.
+    """
+    for _ in range(retries):
+        try:
+            sock.sendto(packet, addr)
+        except socket.error as e:
+            logger.error(f"Socket error while sending: {e}")
+            return False
+
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                data, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                break  # no ACK before the deadline, retransmit
+            except socket.error as e:
+                logger.error(f"Socket error while waiting for ACK: {e}")
+                return False
+
+            if len(data) < 4:
+                continue
+
+            opcode = data[:2]
+            if opcode == struct.pack('!H', OP_ERROR):
+                logger.error(f"Client sent error: {data[2:].decode('utf-8', errors='replace')}")
+                return False
+            if opcode == struct.pack('!H', OP_ACK):
+                ack_block = struct.unpack('!H', data[2:4])[0]
+                if ack_block == expected_block:
+                    return True
+
+    logger.warning(f"Giving up: no ACK for block {expected_block} after {retries} attempts")
+    return False
+
 def handle_tftp(sock):
     """Handle TFTP requests on the given socket."""
     sock.settimeout(SOCKET_TIMEOUT)  # Устанавливаем таймаут для сокета
@@ -59,8 +125,8 @@ def handle_tftp(sock):
     if opcode == struct.pack('!H', OP_RRQ):
         # Handle download (RRQ)
         filename = data[2:].decode('utf-8').split('\x00')[0]
-        filepath = os.path.join(TFTP_ROOT_DIR, filename)
-        if not os.path.exists(filepath):
+        filepath = resolve_file_path(filename)
+        if filepath is None or not os.path.isfile(filepath):
             logger.warning(f"File {filename} not found.")
             sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x01File not found\x00', addr)
             return
@@ -80,29 +146,79 @@ def handle_tftp(sock):
         if blksize > 65464:  # Maximum allowed block size per RFC 2348
             blksize = DEFAULT_BLOCKSIZE
 
-        # Send OACK if block size was negotiated
+        # Open the file before ACKing so permission errors are reported early.
+        try:
+            f = open(filepath, 'rb')
+        except OSError as e:
+            logger.error(f"Cannot open {filepath}: {e}")
+            sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x02Access violation\x00', addr)
+            return
+
+        # If options were negotiated, send OACK and wait for ACK block 0
+        # before sending any DATA (RFC 2347).
         if 'blksize' in options:
             oack = struct.pack('!H', OP_OACK) + b'blksize\x00' + str(blksize).encode() + b'\x00'
-            sock.sendto(oack, addr)
+            if not _send_and_wait_ack(sock, addr, oack, 0):
+                f.close()
+                return
 
-        # Send file in DATA packets with negotiated block size
-        with open(filepath, 'rb') as f:
-            block = 1
+        # Stream the file one block at a time, waiting for the ACK of each
+        # block before reading the next one.
+        block = 1
+        data_sent = False
+        last_was_full = False
+        try:
             while True:
                 chunk = f.read(blksize)
-                if not chunk:
+                if chunk == b'':
                     break
                 packet = struct.pack('!H', OP_DATA) + struct.pack('!H', block) + chunk
-                sock.sendto(packet, addr)
-                block += 1
+                if not _send_and_wait_ack(sock, addr, packet, block):
+                    return
+                data_sent = True
+                last_was_full = (len(chunk) == blksize)
+                if not last_was_full:
+                    break
+                # Block numbers are 16-bit and wrap around after 65535 (RFC 2348).
+                block = (block + 1) % 65536
+        finally:
+            f.close()
+
+        # Send a final empty DATA block when the file was empty or ended on a
+        # block boundary (RFC 1350).
+        if not data_sent or last_was_full:
+            packet = struct.pack('!H', OP_DATA) + struct.pack('!H', block) + b''
+            if not _send_and_wait_ack(sock, addr, packet, block):
+                return
 
     elif opcode == struct.pack('!H', OP_WRQ):
         # Handle upload (WRQ)
         filename = data[2:].decode('utf-8').split('\x00')[0]
-        if not ALLOWED_FILENAME_REGEX.match(filename):
-            logger.warning(f"Filename {filename} is not allowed.")
-            sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x02Access denied\x00', addr)
-            return
+
+        # Files matching the mask are pushed to the HTTP endpoint, everything
+        # else is stored locally as a regular TFTP upload.
+        upload_to_http = bool(ALLOWED_FILENAME_REGEX.match(filename))
+
+        # Prepare the destination before the transfer starts so we can report
+        # an error immediately if the local file cannot be created.
+        out_file = None
+        file_data = None
+        if upload_to_http:
+            file_data = io.BytesIO()
+        else:
+            local_filepath = resolve_file_path(filename)
+            if local_filepath is None:
+                logger.warning(f"Filename {filename} is not allowed.")
+                sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x02Access denied\x00', addr)
+                return
+            try:
+                parent = os.path.dirname(local_filepath) or '.'
+                os.makedirs(parent, exist_ok=True)
+                out_file = open(local_filepath, 'wb')
+            except OSError as e:
+                logger.error(f"Cannot create {local_filepath}: {e}")
+                sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x02Access violation\x00', addr)
+                return
 
         # Check for TFTP options (e.g., blksize)
         options = {}
@@ -129,8 +245,6 @@ def handle_tftp(sock):
 
         sock.sendto(oack, addr)
 
-        file_data = io.BytesIO()
-
         while True:
             try:
                 data, _ = sock.recvfrom(blksize + 4)  # +4 for opcode and block number
@@ -144,9 +258,19 @@ def handle_tftp(sock):
             opcode = data[:2]
             if opcode == struct.pack('!H', OP_DATA):
                 block_num = struct.unpack('!H', data[2:4])[0]
-                if block_num == block + 1:
+                if block_num == (block + 1) % 65536:
                     chunk = data[4:]
-                    file_data.write(chunk)
+                    try:
+                        if out_file is not None:
+                            out_file.write(chunk)
+                        else:
+                            file_data.write(chunk)
+                    except OSError as e:
+                        logger.error(f"Cannot write upload: {e}")
+                        sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x03Disk full or allocation exceeded\x00', addr)
+                        if out_file is not None:
+                            out_file.close()
+                        return
                     ack = struct.pack('!H', OP_ACK) + struct.pack('!H', block_num)
                     sock.sendto(ack, addr)
                     block = block_num
@@ -158,8 +282,12 @@ def handle_tftp(sock):
             else:
                 break
 
-        logger.info(f"File {filename} uploaded via TFTP in {block} blocks.")
-        send_file_to_http(filename, file_data.getvalue())
+        if upload_to_http:
+            logger.info(f"File {filename} uploaded via TFTP in {block} blocks.")
+            send_file_to_http(filename, file_data.getvalue())
+        else:
+            out_file.close()
+            logger.info(f"File {filename} saved to {local_filepath} in {block} blocks.")
 
 if __name__ == "__main__":
     os.makedirs(TFTP_ROOT_DIR, exist_ok=True)
