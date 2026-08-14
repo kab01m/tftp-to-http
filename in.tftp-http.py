@@ -97,7 +97,12 @@ def _send_and_wait_ack(sock, addr, packet, expected_block, retries=5, timeout=3)
 
             opcode = data[:2]
             if opcode == struct.pack('!H', OP_ERROR):
-                logger.error(f"Client sent error: {data[2:].decode('utf-8', errors='replace')}")
+                if len(data) >= 4:
+                    err_code = struct.unpack('!H', data[2:4])[0]
+                    err_msg = data[4:].split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+                    logger.error(f"Client sent error code {err_code}: {err_msg}")
+                else:
+                    logger.error("Client sent malformed error packet")
                 return False
             if opcode == struct.pack('!H', OP_ACK):
                 ack_block = struct.unpack('!H', data[2:4])[0]
@@ -131,13 +136,14 @@ def handle_tftp(sock):
             sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x01File not found\x00', addr)
             return
 
-        # Check for TFTP options (e.g., blksize)
+        # Parse TFTP options (blksize, tsize).
         options = {}
         parts = data[2:].decode('utf-8').split('\x00')
         for i in range(len(parts)):
-            if parts[i].lower() == 'blksize':
+            name = parts[i].lower()
+            if name in ('blksize', 'tsize'):
                 try:
-                    options['blksize'] = int(parts[i+1])
+                    options[name] = int(parts[i + 1])
                 except (IndexError, ValueError):
                     pass
 
@@ -154,13 +160,19 @@ def handle_tftp(sock):
             sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x02Access violation\x00', addr)
             return
 
-        # If options were negotiated, send OACK and wait for ACK block 0
-        # before sending any DATA (RFC 2347).
-        if 'blksize' in options:
-            oack = struct.pack('!H', OP_OACK) + b'blksize\x00' + str(blksize).encode() + b'\x00'
-            if not _send_and_wait_ack(sock, addr, oack, 0):
-                f.close()
-                return
+        # If options were requested, negotiate them via OACK and wait for
+        # ACK block 0 before sending any DATA (RFC 2347/2349).
+        if options:
+            oack_fields = []
+            if 'blksize' in options:
+                oack_fields.append(b'blksize\x00' + str(blksize).encode() + b'\x00')
+            if 'tsize' in options:
+                oack_fields.append(b'tsize\x00' + str(os.path.getsize(filepath)).encode() + b'\x00')
+            if oack_fields:
+                oack = struct.pack('!H', OP_OACK) + b''.join(oack_fields)
+                if not _send_and_wait_ack(sock, addr, oack, 0):
+                    f.close()
+                    return
 
         # Stream the file one block at a time, waiting for the ACK of each
         # block before reading the next one.
@@ -220,13 +232,14 @@ def handle_tftp(sock):
                 sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x02Access violation\x00', addr)
                 return
 
-        # Check for TFTP options (e.g., blksize)
+        # Parse TFTP options (blksize, tsize).
         options = {}
         parts = data[2:].decode('utf-8').split('\x00')
         for i in range(len(parts)):
-            if parts[i].lower() == 'blksize':
+            name = parts[i].lower()
+            if name in ('blksize', 'tsize'):
                 try:
-                    options['blksize'] = int(parts[i+1])
+                    options[name] = int(parts[i + 1])
                 except (IndexError, ValueError):
                     pass
 
@@ -237,9 +250,15 @@ def handle_tftp(sock):
 
         block = 0
 
-        # Send OACK if block size was negotiated or empty ACK if not
-        if 'blksize' in options:
-            oack = struct.pack('!H', OP_OACK) + b'blksize\x00' + str(blksize).encode() + b'\x00'
+        # Send OACK for requested options or an empty ACK otherwise.
+        if options:
+            oack_fields = []
+            if 'blksize' in options:
+                oack_fields.append(b'blksize\x00' + str(blksize).encode() + b'\x00')
+            if 'tsize' in options:
+                # The server does not know the final size of an upload yet.
+                oack_fields.append(b'tsize\x00' + b'0\x00')
+            oack = struct.pack('!H', OP_OACK) + b''.join(oack_fields)
         else:
             oack = struct.pack('!H', OP_ACK) + struct.pack('!H', block)
 
