@@ -192,6 +192,8 @@ def handle_tftp(sock):
                 if not last_was_full:
                     break
                 # Block numbers are 16-bit and wrap around after 65535 (RFC 2348).
+                if block == 65535:
+                    logger.info(f"Block number cycled to 0 after 65535 for {filename}")
                 block = (block + 1) % 65536
         finally:
             f.close()
@@ -278,6 +280,8 @@ def handle_tftp(sock):
             if opcode == struct.pack('!H', OP_DATA):
                 block_num = struct.unpack('!H', data[2:4])[0]
                 if block_num == (block + 1) % 65536:
+                    if block == 65535:
+                        logger.info(f"Block number cycled to 0 after 65535 for {filename}")
                     chunk = data[4:]
                     try:
                         if out_file is not None:
