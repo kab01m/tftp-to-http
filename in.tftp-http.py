@@ -136,6 +136,8 @@ def handle_tftp(sock):
             sock.sendto(struct.pack('!H', OP_ERROR) + b'\x00\x01File not found\x00', addr)
             return
 
+        logger.info(f"Client {addr[0]}:{addr[1]} downloading {filename}")
+
         # Parse TFTP options (blksize, tsize).
         options = {}
         parts = data[2:].decode('utf-8').split('\x00')
@@ -208,6 +210,8 @@ def handle_tftp(sock):
     elif opcode == struct.pack('!H', OP_WRQ):
         # Handle upload (WRQ)
         filename = data[2:].decode('utf-8').split('\x00')[0]
+
+        logger.info(f"Client {addr[0]}:{addr[1]} uploading {filename}")
 
         # Files matching the mask are pushed to the HTTP endpoint, everything
         # else is stored locally as a regular TFTP upload.
