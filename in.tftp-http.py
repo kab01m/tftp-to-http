@@ -255,6 +255,7 @@ def handle_tftp(sock):
             blksize = DEFAULT_BLOCKSIZE
 
         block = 0
+        transfer_complete = False
 
         # Send OACK for requested options or an empty ACK otherwise.
         if options:
@@ -302,6 +303,7 @@ def handle_tftp(sock):
                     sock.sendto(ack, addr)
                     block = block_num
                     if len(chunk) < blksize:
+                        transfer_complete = True
                         break
                 else:
                     ack = struct.pack('!H', OP_ACK) + struct.pack('!H', block)
@@ -310,11 +312,21 @@ def handle_tftp(sock):
                 break
 
         if upload_to_http:
-            logger.info(f"File {filename} uploaded via TFTP in {block} blocks.")
-            send_file_to_http(filename, file_data.getvalue())
+            if transfer_complete:
+                logger.info(f"File {filename} uploaded via TFTP in {block} blocks.")
+                send_file_to_http(filename, file_data.getvalue())
+            else:
+                logger.error(f"Upload {filename} incomplete, not sending to HTTP")
         else:
             out_file.close()
-            logger.info(f"File {filename} saved to {local_filepath} in {block} blocks.")
+            if transfer_complete:
+                logger.info(f"File {filename} saved to {local_filepath} in {block} blocks.")
+            else:
+                try:
+                    os.remove(local_filepath)
+                except OSError as e:
+                    logger.error(f"Cannot remove partial file {local_filepath}: {e}")
+                logger.error(f"Upload {filename} incomplete, partial file removed")
 
 if __name__ == "__main__":
     os.makedirs(TFTP_ROOT_DIR, exist_ok=True)
